@@ -3,14 +3,17 @@
 /**
  * agent-runner.js — Runs inside each Windows Terminal pane.
  *
- * Responsibilities:
- *   1. Connect to the orchestrator WebSocket
- *   2. Spawn the Claude CLI process
- *   3. Inject the system prompt so Claude knows its role and the message protocol
- *   4. Bridge stdin (user keyboard) → Claude stdin
- *   5. Bridge Claude stdout → display in pane + stream to orchestrator
- *   6. Parse Claude stdout for [SEND:id] / [BROADCAST] directives and route them
- *   7. Receive incoming messages from orchestrator → inject into Claude stdin
+ * Uses Claude CLI in --print --output-format=stream-json --input-format=stream-json mode.
+ * This gives structured JSON per token/event on stdout and accepts JSON user messages on stdin,
+ * enabling reliable multi-turn operation without scraping interactive terminal output.
+ *
+ * Claude stdout events (one JSON per line):
+ *   {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}  — streaming token
+ *   {"type":"message_stop"}  — response complete
+ *   {"type":"message_start","message":{...}}  — new response starting
+ *
+ * Claude stdin input (one JSON per line):
+ *   {"type":"user","message":{"role":"user","content":"..."}}
  */
 
 const { program } = require('commander');
@@ -36,178 +39,144 @@ const port = parseInt(portStr, 10);
 const isMain = agentId === 'main';
 
 // ---------------------------------------------------------------------------
-// Terminal styling helpers (ANSI)
+// ANSI color helpers
 // ---------------------------------------------------------------------------
 const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
 const DIM = '\x1b[2m';
-const CYAN = '\x1b[36m';
-const YELLOW = '\x1b[33m';
-const GREEN = '\x1b[32m';
-const MAGENTA = '\x1b[35m';
-const RED = '\x1b[31m';
 
-function agentColor(id) {
-  if (id === 'main') return CYAN;
-  // cycle through colors for workers
-  const colors = [GREEN, YELLOW, MAGENTA, '\x1b[34m', '\x1b[35m', '\x1b[91m', '\x1b[92m'];
-  const n = parseInt(id.replace('worker-', ''), 10) - 1;
-  return colors[n % colors.length];
+const COLORS = {
+  main:     '\x1b[36m',  // cyan
+  'worker-1': '\x1b[32m',  // green
+  'worker-2': '\x1b[33m',  // yellow
+  'worker-3': '\x1b[35m',  // magenta
+  'worker-4': '\x1b[34m',  // blue
+  'worker-5': '\x1b[91m',  // bright red
+  'worker-6': '\x1b[92m',  // bright green
+  'worker-7': '\x1b[93m',  // bright yellow
+};
+
+function color(id) {
+  return COLORS[id] || '\x1b[37m';
 }
 
 function printHeader() {
-  const color = agentColor(agentId);
-  console.log(`${color}${BOLD}╔════════════════════════════════════════╗${RESET}`);
-  console.log(`${color}${BOLD}║  Multi-Agent System — ${agentId.padEnd(17)}║${RESET}`);
-  console.log(`${color}${BOLD}╚════════════════════════════════════════╝${RESET}`);
-  console.log(`${DIM}Connecting to orchestrator on port ${port}...${RESET}`);
+  const c = color(agentId);
+  const label = isMain ? 'Main Agent (user-facing)' : `${agentId}`;
+  console.log(`${c}${BOLD}╔══════════════════════════════════════════╗${RESET}`);
+  console.log(`${c}${BOLD}║  Multi-Agent System — ${label.padEnd(19)}║${RESET}`);
+  console.log(`${c}${BOLD}╚══════════════════════════════════════════╝${RESET}`);
 }
 
-function printIncoming(fromId, content) {
-  const color = agentColor(fromId);
-  process.stdout.write(`\n${color}${BOLD}[FROM:${fromId}]${RESET} ${content}\n`);
+function printSystem(msg) {
+  process.stdout.write(`${DIM}[system] ${msg}${RESET}\n`);
 }
 
-function printSystem(content) {
-  process.stdout.write(`${DIM}[system] ${content}${RESET}\n`);
+function printFromAgent(fromId, text) {
+  const c = color(fromId);
+  process.stdout.write(`\n${c}${BOLD}◀ [FROM:${fromId}]${RESET} ${text}\n`);
 }
 
 // ---------------------------------------------------------------------------
-// Load system prompt
+// System prompt loader
 // ---------------------------------------------------------------------------
-function loadPrompt() {
-  const promptFile = isMain ? 'main.txt' : 'worker.txt';
-  const promptPath = path.resolve(__dirname, '..', 'prompts', promptFile);
-
-  let template;
-  try {
-    template = fs.readFileSync(promptPath, 'utf8');
-  } catch {
-    // Fallback inline prompt if file not found
-    template = isMain
-      ? defaultMainPrompt(totalWorkers)
-      : defaultWorkerPrompt(agentId, totalWorkers);
-    return template;
-  }
-
-  // Replace placeholders
-  return template
-    .replace(/\{id\}/g, agentId)
-    .replace(/\{N\}/g, String(totalWorkers))
-    .replace(/\{workers\}/g, buildWorkerList(totalWorkers));
-}
-
 function buildWorkerList(n) {
   return Array.from({ length: n }, (_, i) => `worker-${i + 1}`).join(', ');
 }
 
-function defaultMainPrompt(n) {
-  return `You are the Main Coordinator Agent in a multi-agent terminal system.
-You have ${n} coworker agent(s) available: ${buildWorkerList(n)}.
-
-COMMUNICATION PROTOCOL:
-- To send a task to a specific agent, begin your message with: [SEND:worker-N] your message
-- To broadcast a message to ALL workers, begin with: [BROADCAST] your message
-- Workers' responses arrive prefixed with [FROM:worker-N]
-
-Your role:
-1. Receive tasks from the user
-2. Break them down and delegate sub-tasks to appropriate workers using [SEND:] or [BROADCAST]
-3. Synthesize workers' results and present a final answer to the user
-
-Be concise and coordinate effectively. Workers are capable Claude agents.`;
+function loadPrompt() {
+  const file = isMain ? 'main.txt' : 'worker.txt';
+  const fullPath = path.resolve(__dirname, '..', 'prompts', file);
+  try {
+    return fs.readFileSync(fullPath, 'utf8')
+      .replace(/\{id\}/g, agentId)
+      .replace(/\{N\}/g, String(totalWorkers))
+      .replace(/\{workers\}/g, buildWorkerList(totalWorkers));
+  } catch {
+    // Inline fallback
+    return isMain ? inlineMainPrompt() : inlineWorkerPrompt();
+  }
 }
 
-function defaultWorkerPrompt(id, n) {
-  return `You are ${id} in a multi-agent terminal system.
-The main coordinator and ${n - 1} peer agent(s) are also running.
+function inlineMainPrompt() {
+  const workers = buildWorkerList(totalWorkers);
+  return `You are the Main Coordinator Agent in a multi-agent terminal system.
+Workers available: ${workers}.
+To delegate: DISPATCH:<worker-id>:<task instruction>
+Workers reply as RESPONSE:<worker-id>:<content>
+Coordinate, delegate sub-tasks, synthesize results for the user.`;
+}
 
-COMMUNICATION PROTOCOL:
-- Messages from other agents arrive prefixed with [FROM:agent-id]
-- To reply to the main agent or any peer: [SEND:main] or [SEND:worker-N] your message
-- To broadcast to everyone: [BROADCAST] your message
-- Normal responses (no prefix) are automatically forwarded to the main agent
-
-Your role:
-- Execute the specific sub-task assigned to you
-- Report results clearly and concisely
-- Collaborate with peer agents when needed`;
+function inlineWorkerPrompt() {
+  return `You are ${agentId} in a multi-agent terminal system.
+You receive task instructions and must respond with focused, actionable output.
+Your responses are forwarded to the main agent. Be concise.`;
 }
 
 // ---------------------------------------------------------------------------
 // WebSocket connection to orchestrator
 // ---------------------------------------------------------------------------
-let ws;
+let ws = null;
 let wsReady = false;
-const messageQueue = []; // queue messages while WS is connecting
+const wsQueue = [];
 
 function connectOrchestrator() {
   ws = new WebSocket(`ws://127.0.0.1:${port}`);
 
   ws.on('open', () => {
     wsReady = true;
-    // Register this agent
     wsSend({ type: 'register', from: agentId, to: 'orchestrator', content: '' });
-    // Flush queued messages
-    while (messageQueue.length) wsSend(messageQueue.shift());
+    wsQueue.splice(0).forEach(m => wsSend(m));
     printSystem(`Connected to orchestrator as "${agentId}"`);
   });
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-    handleIncoming(msg);
+    handleWsMessage(msg);
   });
 
   ws.on('close', () => {
     wsReady = false;
-    printSystem('Disconnected from orchestrator. Reconnecting in 2s...');
+    printSystem('Disconnected. Reconnecting in 2s...');
     setTimeout(connectOrchestrator, 2000);
   });
 
   ws.on('error', (err) => {
-    // Error is followed by 'close', reconnect handled there
-    if (err.code !== 'ECONNREFUSED') {
-      printSystem(`WS error: ${err.message}`);
-    }
+    if (err.code !== 'ECONNREFUSED') printSystem(`WS error: ${err.message}`);
   });
 }
 
 function wsSend(msg) {
-  if (wsReady && ws.readyState === WebSocket.OPEN) {
+  if (wsReady && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   } else {
-    messageQueue.push(msg);
+    wsQueue.push(msg);
   }
 }
 
-/**
- * Handle a message arriving from the orchestrator.
- * Inject it into Claude's stdin so Claude can see it and respond.
- */
-function handleIncoming(msg) {
+// ---------------------------------------------------------------------------
+// Handle incoming WebSocket messages
+// ---------------------------------------------------------------------------
+function handleWsMessage(msg) {
   if (msg.type === 'system') {
     printSystem(msg.content);
-    if (msg.content === 'shutdown') {
-      gracefulShutdown();
-    }
+    if (msg.content === 'shutdown') gracefulShutdown();
     return;
   }
 
   if (msg.type === 'stream') {
-    // Live output from another agent — display but don't inject into Claude
-    // (avoids feedback loops; only targeted messages get injected)
-    const color = agentColor(msg.from);
-    process.stdout.write(`${color}${DIM}[${msg.from}] ${msg.content}${RESET}`);
+    // Live output chunk from another agent — display (dim) but don't inject into Claude
+    const c = color(msg.from);
+    process.stdout.write(`${c}${DIM}[${msg.from}] ${msg.content}${RESET}`);
     return;
   }
 
   if (msg.type === 'message' || msg.type === 'broadcast') {
-    printIncoming(msg.from, msg.content);
-    // Inject into Claude as context
-    if (claudeProcess && claudeProcess.stdin.writable) {
-      claudeProcess.stdin.write(`\n[FROM:${msg.from}]: ${msg.content}\n`);
-    }
+    // Targeted or broadcast message — show it and inject into Claude as context
+    printFromAgent(msg.from, msg.content);
+    injectUserMessage(`[FROM:${msg.from}]: ${msg.content}`);
+    return;
   }
 }
 
@@ -215,7 +184,7 @@ function handleIncoming(msg) {
 // Claude CLI process
 // ---------------------------------------------------------------------------
 let claudeProcess = null;
-let claudeBuffer = '';
+let streamBuffer = ''; // accumulates current response
 
 function spawnClaude() {
   const systemPrompt = loadPrompt();
@@ -227,55 +196,121 @@ function spawnClaude() {
   });
 
   claudeProcess.on('error', (err) => {
-    console.error(`${RED}[agent-runner] Failed to start Claude CLI: ${err.message}${RESET}`);
-    console.error(`${RED}Make sure "claude" is installed: npm install -g @anthropic-ai/claude-code${RESET}`);
+    console.error(`\x1b[31m[agent-runner] Claude CLI error: ${err.message}\x1b[0m`);
+    console.error('\x1b[31mEnsure: npm install -g @anthropic-ai/claude-code\x1b[0m');
     process.exit(1);
   });
 
   claudeProcess.on('exit', (code, signal) => {
-    console.log(`\n${DIM}[agent-runner] Claude exited (code=${code}, signal=${signal})${RESET}`);
+    printSystem(`Claude exited (code=${code}, signal=${signal})`);
     process.exit(code ?? 0);
   });
 
-  // Write system prompt as the very first input to Claude
-  claudeProcess.stdin.write(systemPrompt + '\n');
-
-  // Stream Claude's stdout: display locally + relay to orchestrator
-  claudeProcess.stdout.on('data', (chunk) => {
-    const text = chunk.toString();
-    process.stdout.write(text); // display in this pane
-
-    // Buffer for directive parsing (newline-delimited)
-    claudeBuffer += text;
-    const lines = claudeBuffer.split('\n');
-    claudeBuffer = lines.pop(); // keep incomplete last line
-
-    for (const line of lines) {
-      parseAndRoute(line);
-    }
-
-    // Stream chunks to all other agents (so they see live output)
-    wsSend({ type: 'stream', from: agentId, to: 'all', content: text, timestamp: new Date().toISOString() });
-  });
-
-  // Forward Claude's stderr to our stderr
+  // Forward stderr to our stderr (API errors, debug info)
   claudeProcess.stderr.on('data', (chunk) => {
     process.stderr.write(chunk);
   });
+
+  // Parse Claude's structured JSON output line by line
+  const rl = readline.createInterface({ input: claudeProcess.stdout, terminal: false });
+
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    let event;
+    try { event = JSON.parse(line); } catch { return; }
+    handleClaudeEvent(event);
+  });
+
+  // Inject system prompt as the very first user message
+  injectUserMessage(systemPrompt);
 }
 
 /**
- * Parse a line of Claude output for routing directives.
- * Removes the directive from the forwarded stream content is fine —
- * the raw stdout is already displayed. We just extract and send.
+ * Write a user message to Claude's stdin in stream-json format.
+ * Claude processes each JSON-line message and produces a response.
  */
-function parseAndRoute(line) {
-  const trimmed = line.trim();
+function injectUserMessage(content) {
+  if (!claudeProcess || !claudeProcess.stdin.writable) return;
+  const msg = JSON.stringify({ type: 'user', message: { role: 'user', content } });
+  claudeProcess.stdin.write(msg + '\n');
+}
 
-  // [SEND:target-id] message
-  const sendMatch = trimmed.match(config.sendPattern);
-  if (sendMatch) {
-    const [, targetId, content] = sendMatch;
+/**
+ * Handle a structured JSON event from Claude's stdout.
+ */
+function handleClaudeEvent(event) {
+  switch (event.type) {
+    case 'content_block_delta': {
+      const delta = event.delta?.text ?? event.delta?.partial_json ?? '';
+      if (!delta) return;
+
+      // Show in this pane
+      process.stdout.write(delta);
+      streamBuffer += delta;
+
+      // Relay live to all other agents
+      wsSend({
+        type: 'stream',
+        from: agentId,
+        to: 'all',
+        content: delta,
+        timestamp: new Date().toISOString(),
+      });
+      break;
+    }
+
+    case 'message_stop': {
+      // Response complete — parse for routing directives, then reset buffer
+      const fullText = streamBuffer;
+      streamBuffer = '';
+      process.stdout.write('\n'); // newline after streamed response
+
+      parseAndRouteDirectives(fullText);
+      break;
+    }
+
+    case 'message_start':
+    case 'content_block_start':
+    case 'content_block_stop':
+    case 'message_delta':
+      // Structural events — no action needed
+      break;
+
+    default:
+      // Unknown event — ignore
+      break;
+  }
+}
+
+/**
+ * After a full response, scan for routing directives and send them via orchestrator.
+ *
+ * Supported syntax in Claude's output:
+ *   DISPATCH:worker-N:task description   → targeted task to a worker
+ *   [SEND:worker-N] message              → targeted message (legacy / explicit)
+ *   [BROADCAST] message                  → message to all agents
+ *
+ * Workers implicitly send every response to main (handled in handleClaudeEvent).
+ */
+function parseAndRouteDirectives(text) {
+  // DISPATCH pattern (primary dispatch for main agent)
+  const dispatchRe = /DISPATCH:([\w-]+):([^\n]+)/g;
+  let m;
+  while ((m = dispatchRe.exec(text)) !== null) {
+    const [, targetId, instruction] = m;
+    wsSend({
+      type: 'message',
+      from: agentId,
+      to: targetId,
+      content: instruction.trim(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  // [SEND:id] pattern
+  const sendRe = /\[SEND:([\w-]+)\]\s*([^\n\[]+)/g;
+  while ((m = sendRe.exec(text)) !== null) {
+    const [, targetId, content] = m;
     wsSend({
       type: 'message',
       from: agentId,
@@ -283,50 +318,56 @@ function parseAndRoute(line) {
       content: content.trim(),
       timestamp: new Date().toISOString(),
     });
-    return;
   }
 
-  // [BROADCAST] message
-  const broadcastMatch = trimmed.match(config.broadcastPattern);
-  if (broadcastMatch) {
-    const content = broadcastMatch[1].trim();
+  // [BROADCAST] pattern
+  const broadcastRe = /\[BROADCAST\]\s*([^\n\[]+)/g;
+  while ((m = broadcastRe.exec(text)) !== null) {
     wsSend({
       type: 'broadcast',
       from: agentId,
       to: 'all',
-      content,
+      content: m[1].trim(),
       timestamp: new Date().toISOString(),
     });
-    return;
   }
 
-  // For worker agents: non-directive lines are implicitly sent to main
-  if (!isMain && trimmed.length > 0) {
+  // Workers: auto-forward every complete response to main
+  if (!isMain && text.trim()) {
     wsSend({
       type: 'message',
       from: agentId,
       to: 'main',
-      content: trimmed,
+      content: text.trim(),
       timestamp: new Date().toISOString(),
     });
   }
 }
 
 // ---------------------------------------------------------------------------
-// Bridge: user keyboard → Claude stdin
+// Bridge: user keyboard input → Claude stdin (main agent only)
 // ---------------------------------------------------------------------------
 function setupStdinBridge() {
+  if (!isMain) return; // workers don't take keyboard input
+
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
 
   rl.on('line', (line) => {
-    if (claudeProcess && claudeProcess.stdin.writable) {
-      claudeProcess.stdin.write(line + '\n');
-    }
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    // Inject as a new user message to Claude
+    injectUserMessage(trimmed);
+    // Also broadcast to workers as context
+    wsSend({
+      type: 'broadcast',
+      from: agentId,
+      to: 'all',
+      content: `[USER INPUT]: ${trimmed}`,
+      timestamp: new Date().toISOString(),
+    });
   });
 
-  rl.on('close', () => {
-    gracefulShutdown();
-  });
+  rl.on('close', gracefulShutdown);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +392,6 @@ process.on('SIGINT', gracefulShutdown);
 printHeader();
 connectOrchestrator();
 
-// Give the WS connection a moment before spawning Claude
 setTimeout(() => {
   spawnClaude();
   setupStdinBridge();
