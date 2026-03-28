@@ -45,6 +45,12 @@ const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
 const DIM = '\x1b[2m';
 
+// Limits to prevent memory overflow
+const WS_QUEUE_MAX = 100;          // max queued WS messages while disconnected
+const STREAM_BUFFER_MAX = 512 * 1024; // 512 KB max per Claude response buffer
+const WS_RECONNECT_MAX_DELAY = 30000; // 30s ceiling for reconnect backoff
+const WS_RECONNECT_MAX_ATTEMPTS = 20; // give up after ~10 min total
+
 const COLORS = {
   main:     '\x1b[36m',  // cyan
   'worker-1': '\x1b[32m',  // green
@@ -119,12 +125,15 @@ Your responses are forwarded to the main agent. Be concise.`;
 let ws = null;
 let wsReady = false;
 const wsQueue = [];
+let wsReconnectAttempts = 0;
+let wsShuttingDown = false;
 
 function connectOrchestrator() {
   ws = new WebSocket(`ws://127.0.0.1:${port}`);
 
   ws.on('open', () => {
     wsReady = true;
+    wsReconnectAttempts = 0; // reset backoff counter on successful connection
     wsSend({ type: 'register', from: agentId, to: 'orchestrator', content: '' });
     wsQueue.splice(0).forEach(m => wsSend(m));
     printSystem(`Connected to orchestrator as "${agentId}"`);
@@ -138,8 +147,16 @@ function connectOrchestrator() {
 
   ws.on('close', () => {
     wsReady = false;
-    printSystem('Disconnected. Reconnecting in 2s...');
-    setTimeout(connectOrchestrator, 2000);
+    if (wsShuttingDown) return;
+    wsReconnectAttempts++;
+    if (wsReconnectAttempts > WS_RECONNECT_MAX_ATTEMPTS) {
+      printSystem(`Orchestrator unreachable after ${WS_RECONNECT_MAX_ATTEMPTS} attempts — giving up.`);
+      gracefulShutdown();
+      return;
+    }
+    const delay = Math.min(1000 * Math.pow(2, wsReconnectAttempts - 1), WS_RECONNECT_MAX_DELAY);
+    printSystem(`Disconnected. Reconnecting in ${Math.round(delay / 1000)}s (attempt ${wsReconnectAttempts})...`);
+    setTimeout(connectOrchestrator, delay);
   });
 
   ws.on('error', (err) => {
@@ -151,6 +168,12 @@ function wsSend(msg) {
   if (wsReady && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
   } else {
+    if (wsQueue.length >= WS_QUEUE_MAX) {
+      if (wsQueue.length === WS_QUEUE_MAX) {
+        printSystem(`wsQueue at capacity (${WS_QUEUE_MAX}) — dropping oldest messages`);
+      }
+      wsQueue.shift();
+    }
     wsQueue.push(msg);
   }
 }
@@ -162,13 +185,6 @@ function handleWsMessage(msg) {
   if (msg.type === 'system') {
     printSystem(msg.content);
     if (msg.content === 'shutdown') gracefulShutdown();
-    return;
-  }
-
-  if (msg.type === 'stream') {
-    // Live output chunk from another agent — display (dim) but don't inject into Claude
-    const c = color(msg.from);
-    process.stdout.write(`${c}${DIM}[${msg.from}] ${msg.content}${RESET}`);
     return;
   }
 
@@ -247,15 +263,11 @@ function handleClaudeEvent(event) {
       // Show in this pane
       process.stdout.write(delta);
       streamBuffer += delta;
-
-      // Relay live to all other agents
-      wsSend({
-        type: 'stream',
-        from: agentId,
-        to: 'all',
-        content: delta,
-        timestamp: new Date().toISOString(),
-      });
+      if (streamBuffer.length > STREAM_BUFFER_MAX) {
+        // Keep the tail — routing directives (DISPATCH, SEND, BROADCAST) appear at the end
+        streamBuffer = streamBuffer.slice(-STREAM_BUFFER_MAX);
+        printSystem('streamBuffer exceeded cap — oldest content truncated');
+      }
       break;
     }
 
@@ -374,6 +386,7 @@ function setupStdinBridge() {
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 function gracefulShutdown() {
+  wsShuttingDown = true;
   if (claudeProcess) {
     try { claudeProcess.stdin.end(); } catch {}
   }

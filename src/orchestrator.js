@@ -61,12 +61,15 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      case 'broadcast':
-      case 'stream': {
+      case 'broadcast': {
         // Forward to everyone except the sender
         broadcast(msg, msg.from);
         break;
       }
+
+      case 'stream':
+        // Stream messages are dropped — broadcasting per-token deltas caused WS flood / OOM
+        break;
 
       default:
         break;

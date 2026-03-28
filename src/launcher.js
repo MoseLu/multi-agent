@@ -95,11 +95,27 @@ function buildArgArray(segments) {
 
 /**
  * Launch Windows Terminal with the constructed split-pane layout.
+ * On non-Windows platforms, prints manual-launch instructions instead.
  * @param {number} workerCount
  * @param {number} port
  */
 function launch(workerCount, port) {
   const clampedWorkers = Math.min(Math.max(1, workerCount), config.maxWorkers);
+
+  if (process.platform !== 'win32') {
+    // wt.exe is Windows-only. Print commands for the user to run manually.
+    const root = path.resolve(__dirname, '..');
+    console.log('[launcher] Non-Windows platform detected — skipping wt.exe.');
+    console.log('[launcher] Open a separate terminal for each agent and run:');
+    console.log('');
+    console.log(`  node "${path.join(root, 'src', 'agent-runner.js')}" --id=main --workers=${clampedWorkers} --port=${port}`);
+    for (let i = 1; i <= clampedWorkers; i++) {
+      console.log(`  node "${path.join(root, 'src', 'agent-runner.js')}" --id=worker-${i} --workers=${clampedWorkers} --port=${port}`);
+    }
+    console.log('');
+    return; // orchestrator keeps running; no process.exit
+  }
+
   const args = buildWtArgs(clampedWorkers, port);
 
   console.log('[launcher] Starting Windows Terminal...');
