@@ -84,10 +84,9 @@ orchestrator.on('exit', (code) => {
 console.log(`[start] Starting orchestrator on port ${port}...`);
 
 setTimeout(() => {
-  console.log('[start] Launching Windows Terminal...');
+  console.log('[start] Launching agent terminals...');
   launch(workerCount, port);
-  console.log('');
-  console.log('[start] Windows Terminal launched. This process keeps the orchestrator alive.');
+  console.log('[start] Orchestrator is running. This process keeps the orchestrator alive.');
   console.log('[start] Press Ctrl+C to shut down all agents.');
 }, config.orchestratorStartDelay);
 
