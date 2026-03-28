@@ -1,0 +1,20 @@
+{
+  "name": "multi-agent",
+  "version": "1.0.0",
+  "description": "Multi-agent terminal system using Claude CLI with Windows Terminal split panes",
+  "main": "start.js",
+  "scripts": {
+    "start": "node start.js",
+    "start:2": "node start.js --workers=2",
+    "start:4": "node start.js --workers=4"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
