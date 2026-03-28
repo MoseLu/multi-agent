@@ -1,5 +1,17 @@
 'use strict';
 
+// ── Bootstrap: auto-install if node_modules is missing ──────────────────────
+;(function bootstrap() {
+  const fs   = require('fs');
+  const path = require('path');
+  if (!fs.existsSync(path.join(__dirname, 'node_modules'))) {
+    console.log('[bootstrap] First run — installing dependencies...');
+    require('child_process').execSync('npm install', { cwd: __dirname, stdio: 'inherit' });
+    console.log('[bootstrap] Done.\n');
+  }
+})();
+// ── End bootstrap ────────────────────────────────────────────────────────────
+
 /**
  * start.js — Entry point for the Multi-Agent Terminal System
  *
